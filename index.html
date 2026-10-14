@@ -784,9 +784,11 @@
             document.getElementById('deviceIdDisplay').innerText = deviceId;
             document.getElementById('playerNameDisplay').innerText = config.playerName || 'PLAYER';
 
-            // Supabase (per device_id) adalah sumber kebenaran nama — sinkronkan tampilan lokal
-            if (SupabaseConfig.isConfigured()) {
-                const myEntry = await SupabaseConfig.fetchMyEntry(deviceId);
+            RemoteDB.myDocId = await RemoteDB.docId(deviceId);
+
+            // Firestore (per device) adalah sumber kebenaran nama — sinkronkan tampilan lokal
+            if (RemoteDB.isConfigured()) {
+                const myEntry = await RemoteDB.fetchMyEntry(deviceId);
                 if (myEntry && myEntry.player_name && myEntry.player_name !== config.playerName) {
                     config.playerName = myEntry.player_name;
                     GameCache.save({ playerName: myEntry.player_name });
@@ -813,7 +815,7 @@
             }
             if (name === current) return;
 
-            if (!SupabaseConfig.isConfigured()) {
+            if (!RemoteDB.isConfigured()) {
                 alert('Leaderboard global belum aktif, nama hanya tersimpan lokal.');
                 config.playerName = name;
                 GameCache.save({ playerName: name });
@@ -821,7 +823,7 @@
                 return;
             }
 
-            const result = await SupabaseConfig.updateName(name);
+            const result = await RemoteDB.updateName(name);
             if (result.success) {
                 config.playerName = name;
                 GameCache.save({ playerName: name });
@@ -835,48 +837,88 @@
         }
 
         // ============================================================
-        // PART 2: SUPABASE INTEGRATION (CLIENT-SIDE)
+        // PART 2: REMOTE LEADERBOARD (FIRESTORE REST, CLIENT-SIDE)
         // ============================================================
 
-        const SupabaseConfig = {
-            url: 'https://xanhsltfuelpblmyukbb.supabase.co',
-            anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhhbmhzbHRmdWVscGJsbXl1a2JiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU5MTA4MjEsImV4cCI6MjEwMTQ4NjgyMX0.2pdaiKods-ej6r6rXQ709pgyfC1ibFUcC0q7fccLmYk',
-            
-            // Table structure expected in Supabase:
-            // - id (uuid, primary key)
-            // - device_id (text, unique)
-            // - player_name (text)
-            // - score (integer)
-            // - created_at (timestamp)
-            // - synced_at (timestamp)
+        const RemoteDB = {
+            projectId: 'YOUR_PROJECT_ID',
+            apiKey: 'YOUR_API_KEY',
+            collection: 'snake_leaderboard',
+            cooldownSec: 7 * 86400, // keep in sync with firestore.rules
+            myDocId: null,
+
+            // Document id = SHA-256(deviceId), so ids shown on the board can't be replayed to write as someone else.
+            // Fields: player_name, score, created_at, updated_at, name_changed_at (timestamps are set by the server).
+
+            get base() {
+                return `https://firestore.googleapis.com/v1/projects/${this.projectId}/databases/(default)/documents`;
+            },
+
+            async docId(devId) {
+                if (typeof crypto === 'undefined' || !crypto.subtle) return devId;
+                const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(devId));
+                return Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('');
+            },
+
+            toEntry(doc) {
+                const f = doc.fields || {};
+                return {
+                    device_id: doc.name.split('/').pop(),
+                    player_name: (f.player_name && f.player_name.stringValue) || '',
+                    score: parseInt((f.score && f.score.integerValue) || '0', 10),
+                    created_at: (f.created_at && f.created_at.timestampValue) || null,
+                    name_changed_at: (f.name_changed_at && f.name_changed_at.timestampValue) || null
+                };
+            },
+
+            call(path, init) {
+                const sep = path.includes('?') ? '&' : '?';
+                return fetch(`${this.base}${path}${sep}key=${this.apiKey}`, init);
+            },
+
+            // null = no document yet; throws on network/HTTP error
+            async getEntry(id) {
+                const res = await this.call(`/${this.collection}/${id}`);
+                if (res.status === 404) return null;
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                return this.toEntry(await res.json());
+            },
+
+            async write(id, fields, mask, stamps) {
+                const res = await this.call(':commit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ writes: [{
+                        update: { name: `projects/${this.projectId}/databases/(default)/documents/${this.collection}/${id}`, fields },
+                        updateMask: { fieldPaths: mask },
+                        updateTransforms: stamps.map(fieldPath => ({ fieldPath, setToServerValue: 'REQUEST_TIME' }))
+                    }] })
+                });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    throw new Error((err.error && err.error.message) || 'HTTP ' + res.status);
+                }
+                this.updateSyncTime();
+            },
 
             async submitScore(playerName, score) {
                 if (!this.isConfigured()) return null;
-                
-                try {
-                    const response = await fetch(`${this.url}/rest/v1/rpc/rpc_submit_score`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'apikey': this.anonKey,
-                            'Authorization': `Bearer ${this.anonKey}`
-                        },
-                        body: JSON.stringify({
-                            p_device_id: deviceId,
-                            p_player_name: playerName,
-                            p_score: score
-                        })
-                    });
 
-                    if (response.ok) {
-                        this.updateSyncTime();
-                        return { success: true };
-                    } else {
-                        console.error('Supabase error:', response.status);
-                        return { success: false, error: response.statusText };
+                try {
+                    const id = await this.docId(deviceId);
+                    const pts = String(Math.floor(score));
+                    const mine = await this.getEntry(id);
+                    if (!mine) {
+                        const name = String(playerName || 'PLAYER').slice(0, 20);
+                        await this.write(id,
+                            { player_name: { stringValue: name }, score: { integerValue: pts } },
+                            ['player_name', 'score'], ['created_at', 'updated_at', 'name_changed_at']);
+                    } else if (score > mine.score) {
+                        await this.write(id, { score: { integerValue: pts } }, ['score'], ['updated_at']);
                     }
+                    return { success: true };
                 } catch (error) {
-                    console.error('Network error:', error);
+                    console.error('Leaderboard error:', error);
                     return { success: false, error: error.message };
                 }
             },
@@ -885,59 +927,42 @@
                 if (!this.isConfigured()) return { success: false, error: 'not configured' };
 
                 try {
-                    const response = await fetch(`${this.url}/rest/v1/rpc/rpc_update_name`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'apikey': this.anonKey,
-                            'Authorization': `Bearer ${this.anonKey}`
-                        },
-                        body: JSON.stringify({
-                            p_device_id: deviceId,
-                            p_new_name: newName
-                        })
-                    });
+                    const id = await this.docId(deviceId);
+                    const mine = await this.getEntry(id);
+                    // No remote entry yet: it is created with the local name on the first score
+                    if (!mine) return { success: true };
 
-                    if (response.ok) {
-                        this.updateSyncTime();
-                        return { success: true };
-                    }
+                    const wait = this.cooldownSec - (Date.now() - new Date(mine.name_changed_at).getTime()) / 1000;
+                    if (wait > 0) return { success: false, cooldown: wait };
 
-                    const errBody = await response.json().catch(() => ({}));
-                    const msg = errBody.message || errBody.hint || '';
-                    const match = msg.match(/name_change_cooldown:([\d.]+)/);
-                    if (match) return { success: false, cooldown: parseFloat(match[1]) };
-                    return { success: false, error: msg || response.statusText };
+                    await this.write(id, { player_name: { stringValue: newName } }, ['player_name'], ['updated_at', 'name_changed_at']);
+                    return { success: true };
                 } catch (error) {
                     return { success: false, error: error.message };
                 }
             },
 
+            // Returns null on failure so callers can tell "offline" apart from "empty board"
             async fetchLeaderboard(limit = 100) {
-                if (!this.isConfigured()) return [];
-                
-                try {
-                    const response = await fetch(
-                        `${this.url}/rest/v1/snake_leaderboard?select=*&order=score.desc&limit=${limit}`,
-                        {
-                            headers: {
-                                'apikey': this.anonKey,
-                                'Authorization': `Bearer ${this.anonKey}`
-                            }
-                        }
-                    );
+                if (!this.isConfigured()) return null;
 
-                    if (response.ok) {
-                        const data = await response.json();
-                        this.updateSyncTime();
-                        return data;
-                    } else {
-                        console.error('Fetch error:', response.status);
-                        return [];
-                    }
+                try {
+                    const res = await this.call(':runQuery', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ structuredQuery: {
+                            from: [{ collectionId: this.collection }],
+                            orderBy: [{ field: { fieldPath: 'score' }, direction: 'DESCENDING' }],
+                            limit
+                        } })
+                    });
+                    if (!res.ok) throw new Error('HTTP ' + res.status);
+                    const rows = await res.json();
+                    this.updateSyncTime();
+                    return rows.filter(r => r.document).map(r => this.toEntry(r.document));
                 } catch (error) {
-                    console.error('Network error:', error);
-                    return [];
+                    console.error('Fetch error:', error);
+                    return null;
                 }
             },
 
@@ -945,20 +970,7 @@
                 if (!this.isConfigured()) return null;
 
                 try {
-                    const response = await fetch(
-                        `${this.url}/rest/v1/snake_leaderboard?device_id=eq.${devId}&select=player_name,score,name_changed_at&limit=1`,
-                        {
-                            headers: {
-                                'apikey': this.anonKey,
-                                'Authorization': `Bearer ${this.anonKey}`
-                            }
-                        }
-                    );
-                    if (response.ok) {
-                        const data = await response.json();
-                        return data[0] || null;
-                    }
-                    return null;
+                    return await this.getEntry(await this.docId(devId));
                 } catch (error) {
                     console.error('Network error:', error);
                     return null;
@@ -966,8 +978,8 @@
             },
 
             isConfigured() {
-                return this.url !== 'https://YOUR_PROJECT.supabase.co' && 
-                       this.anonKey !== 'YOUR_ANON_KEY';
+                return this.projectId !== 'YOUR_PROJECT_ID' &&
+                       this.apiKey !== 'YOUR_API_KEY';
             },
 
             updateSyncTime() {
@@ -996,9 +1008,9 @@
             const localData = GameCache.loadLeaderboard().sort((a, b) => b.score - a.score).slice(0, 50);
             leaderboardData.local = localData;
 
-            // Try to load global from Supabase
-            if (SupabaseConfig.isConfigured()) {
-                const globalData = await SupabaseConfig.fetchLeaderboard();
+            // Try to load global from Firestore
+            const globalData = await RemoteDB.fetchLeaderboard();
+            if (globalData) {
                 leaderboardData.global = globalData;
                 showSyncStatus('✓ Synced', false);
             } else {
@@ -1065,7 +1077,7 @@
             content.innerHTML = html;
 
             // Show current player's rank
-            const myData = data.find(e => (e.device_id || e.deviceId) === deviceId);
+            const myData = data.find(e => [deviceId, RemoteDB.myDocId].includes(e.device_id || e.deviceId));
             const myRankDisplay = document.getElementById('myRankDisplay');
             if (myData) {
                 const myRank = data.indexOf(myData) + 1;
@@ -1124,7 +1136,7 @@
         }
 
         function updateLastSyncTime() {
-            document.getElementById('lastSync').innerText = SupabaseConfig.getLastSyncTime();
+            document.getElementById('lastSync').innerText = RemoteDB.getLastSyncTime();
         }
 
         function showSyncStatus(message, isError = false) {
@@ -1690,9 +1702,9 @@
             });
             GameCache.saveLeaderboard(localLeaderboard.sort((a,b) => b.score - a.score));
 
-            // Try to submit to Supabase
-            if (SupabaseConfig.isConfigured()) {
-                await SupabaseConfig.submitScore(config.playerName, score);
+            // Try to submit to Firestore
+            if (RemoteDB.isConfigured()) {
+                await RemoteDB.submitScore(config.playerName, score);
             }
 
             document.getElementById('overlay').style.display='flex';

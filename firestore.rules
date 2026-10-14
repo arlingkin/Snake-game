@@ -1,0 +1,35 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /snake_leaderboard/{id} {
+      // Keep in sync with RemoteDB.cooldownSec and gridSize (25x25 cells, +5 per food)
+      function cooldown() { return duration.value(7, 'd'); }
+      function maxScore() { return 3125; }
+      function validFields(d) {
+        return d.keys().hasOnly(['player_name', 'score', 'created_at', 'updated_at', 'name_changed_at'])
+            && d.keys().hasAll(['player_name', 'score', 'created_at', 'updated_at', 'name_changed_at'])
+            && d.player_name is string && d.player_name.size() >= 1 && d.player_name.size() <= 20
+            && d.score is int && d.score >= 0 && d.score <= maxScore()
+            && d.updated_at == request.time;
+      }
+
+      allow read: if true;
+
+      allow create: if id.matches('^[a-f0-9]{64}$')
+        && validFields(request.resource.data)
+        && request.resource.data.created_at == request.time
+        && request.resource.data.name_changed_at == request.time;
+
+      // Score only goes up; name only changes after the cooldown
+      allow update: if validFields(request.resource.data)
+        && request.resource.data.created_at == resource.data.created_at
+        && request.resource.data.score >= resource.data.score
+        && (request.resource.data.player_name == resource.data.player_name
+              ? request.resource.data.name_changed_at == resource.data.name_changed_at
+              : (request.resource.data.name_changed_at == request.time
+                  && request.time >= resource.data.name_changed_at + cooldown()));
+
+      allow delete: if false;
+    }
+  }
+}
